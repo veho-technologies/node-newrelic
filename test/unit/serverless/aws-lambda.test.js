@@ -1553,6 +1553,59 @@ test('AwsLambda.patchLambdaHandler', async (t) => {
       })
   })
 
+  await t.test('should not break process-level enders after a stale ender is called late', async (t) => {
+    const { awsLambda, stubEvent, stubContext, stubCallback } = t.nr
+    tempRemoveListeners({ t, emitter: process, event: 'unhandledRejection' })
+    process.on('unhandledRejection', () => {})
+
+    // Stand in for Node's real handler, which would terminate the test process.
+    const originalFatalException = process._fatalException
+    const fatalException = sinon.stub()
+    process._fatalException = fatalException
+    t.after(() => {
+      process._fatalException = originalFatalException
+    })
+
+    const resolvers = []
+    const wrappedHandler = awsLambda.patchLambdaHandler(
+      () => new Promise((resolve) => resolvers.push(resolve))
+    )
+    const tick = () => new Promise((resolve) => setImmediate(resolve))
+    const invoke = async () => {
+      const promise = wrappedHandler(stubEvent, stubContext, stubCallback)
+      await tick()
+      return { promise, resolve: resolvers[resolvers.length - 1] }
+    }
+    const finish = async (invocation) => {
+      invocation.resolve({})
+      await invocation.promise
+      await tick()
+    }
+
+    // Grow the ender list so a later invocation is bound to a high index.
+    for (let i = 0; i < 5; i++) {
+      await finish(await invoke())
+    }
+
+    // Process-level event ends this invocation and resets the ender list...
+    const staleInvocation = await invoke()
+    process.emit('unhandledRejection', new Error('first'), Promise.resolve())
+    await tick()
+
+    // ...then a new invocation starts, and the earlier one finishes late.
+    const nextInvocation = await invoke()
+    await finish(staleInvocation)
+    await finish(nextInvocation)
+
+    // Neither process-level wrapper may throw, and the fatal wrapper must still
+    // reach the original handler so Node can report the real error.
+    assert.doesNotThrow(() => process.emit('unhandledRejection', new Error('second'), Promise.resolve()))
+    const fatalError = new Error('fatal')
+    process._fatalException(fatalError)
+    assert.equal(fatalException.callCount, 1)
+    assert.equal(fatalException.firstCall.args[0], fatalError)
+  })
+
   await t.test('should record standard background metrics', (t, end) => {
     const { agent, awsLambda, stubEvent, stubContext, stubCallback } = t.nr
     agent.on('harvestStarted', confirmMetrics)
