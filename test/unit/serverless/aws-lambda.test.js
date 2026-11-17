@@ -1553,6 +1553,91 @@ test('AwsLambda.patchLambdaHandler', async (t) => {
       })
   })
 
+  await t.test('should not throw in process-level wrappers after an invocation finishes late', async (t) => {
+    const { awsLambda, stubEvent, stubContext, stubCallback } = t.nr
+    tempRemoveListeners({ t, emitter: process, event: 'unhandledRejection' })
+
+    // Stand in for Node's real handler, which would terminate the test process.
+    const originalFatalException = process._fatalException
+    const fatalException = sinon.stub()
+    process._fatalException = fatalException
+    t.after(() => {
+      process._fatalException = originalFatalException
+    })
+
+    const resolvers = []
+    const wrappedHandler = awsLambda.patchLambdaHandler(
+      () => new Promise((resolve) => resolvers.push(resolve))
+    )
+    const tick = () => new Promise((resolve) => setImmediate(resolve))
+    const invoke = async () => {
+      const promise = wrappedHandler(stubEvent, stubContext, stubCallback)
+      await tick()
+      return { promise, resolve: resolvers[resolvers.length - 1] }
+    }
+    const finish = async (invocation) => {
+      invocation.resolve({})
+      await invocation.promise
+      await tick()
+    }
+
+    // Complete a few invocations first, as in a warm environment; the old
+    // index-based ender list needed these for a late finish to leave gaps in it.
+    for (let i = 0; i < 5; i++) {
+      await finish(await invoke())
+    }
+
+    // A process-level event ends the invocation that is still running...
+    const staleInvocation = await invoke()
+    process.emit('unhandledRejection', new Error('first'), Promise.resolve())
+    await tick()
+
+    // ...then a new invocation starts, and the earlier one finishes late.
+    const nextInvocation = await invoke()
+    await finish(staleInvocation)
+    await finish(nextInvocation)
+
+    // Neither process-level wrapper may throw, and the fatal wrapper must still
+    // reach the original handler so Node can report the real error.
+    assert.doesNotThrow(() => process.emit('unhandledRejection', new Error('second'), Promise.resolve()))
+    const fatalError = new Error('fatal')
+    process._fatalException(fatalError)
+    assert.equal(fatalException.callCount, 1)
+    assert.equal(fatalException.firstCall.args[0], fatalError)
+  })
+
+  await t.test('should still end a new invocation after an earlier one finishes late', async (t) => {
+    const { agent, awsLambda, stubEvent, stubContext, stubCallback } = t.nr
+    tempRemoveListeners({ t, emitter: process, event: 'unhandledRejection' })
+
+    const invocations = []
+    const wrappedHandler = awsLambda.patchLambdaHandler(
+      () => new Promise((resolve) => invocations.push({ transaction: agent.tracer.getTransaction(), resolve }))
+    )
+    const tick = () => new Promise((resolve) => setImmediate(resolve))
+
+    // A process-level event ends the first invocation while it is still running,
+    // then a second invocation starts.
+    const firstPromise = wrappedHandler(stubEvent, stubContext, stubCallback)
+    await tick()
+    process.emit('unhandledRejection', new Error('first'), Promise.resolve())
+    const secondPromise = wrappedHandler(stubEvent, stubContext, stubCallback)
+    await tick()
+    const [first, second] = invocations
+
+    // The first invocation finishes late. The old index-based ender list let it
+    // overwrite the second invocation's ender, so the second never ended.
+    first.resolve({})
+    await firstPromise
+    await tick()
+    assert.equal(second.transaction.isActive(), true)
+
+    second.resolve({})
+    await secondPromise
+    await tick()
+    assert.equal(second.transaction.isActive(), false)
+  })
+
   await t.test('should record standard background metrics', (t, end) => {
     const { agent, awsLambda, stubEvent, stubContext, stubCallback } = t.nr
     agent.on('harvestStarted', confirmMetrics)
